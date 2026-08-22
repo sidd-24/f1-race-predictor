@@ -1,0 +1,320 @@
+"""
+Feature Engineering for F1 Race Prediction
+
+Transforms raw F1 data into ML-ready features including:
+- Grid position
+- Championship standings
+- Historical track performance
+- Recent form (last N races)
+- Qualifying gaps
+"""
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+import logging
+import argparse
+
+from .config import DATA_DIR, FEATURE_COLUMNS, TARGET_COLUMN, DEFAULT_DATA_PREFIX
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+def load_raw_data(prefix: str = DEFAULT_DATA_PREFIX) -> dict:
+    """Load raw CSV data files."""
+    data = {}
+    for key in ['races', 'qualifying', 'standings']:
+        filepath = DATA_DIR / f"{prefix}_{key}.csv"
+        if filepath.exists():
+            data[key] = pd.read_csv(filepath)
+            logger.info(f"Loaded {len(data[key])} rows from {filepath.name}")
+        else:
+            logger.warning(f"File not found: {filepath}")
+            data[key] = pd.DataFrame()
+    return data
+
+
+def merge_race_qualifying(races: pd.DataFrame, qualifying: pd.DataFrame) -> pd.DataFrame:
+    """Merge race results with qualifying data."""
+    if races.empty or qualifying.empty:
+        return races
+
+    # Standardize column names for merging
+    qualifying_clean = qualifying.rename(columns={
+        'Abbreviation': 'Driver',
+        'QualifyingPosition': 'QualifyingPos'
+    })
+
+    races_clean = races.copy()
+    races_clean['Driver'] = races_clean['Abbreviation']
+
+    # Merge on Year, Round, and Driver
+    merged = races_clean.merge(
+        qualifying_clean[['Year', 'Round', 'Driver', 'QualifyingPos', 'Q1', 'Q2', 'Q3']],
+        on=['Year', 'Round', 'Driver'],
+        how='left'
+    )
+
+    return merged
+
+
+def add_standings(df: pd.DataFrame, standings: pd.DataFrame) -> pd.DataFrame:
+    """Add championship standings information."""
+    if standings.empty:
+        return df
+
+    standings_clean = standings.rename(columns={'Driver': 'DriverAbbr'})
+
+    merged = df.merge(
+        standings_clean[[
+            'Year', 'Round', 'DriverAbbr',
+            'DriverPointsBefore', 'DriverChampionshipPosition',
+            'ConstructorPointsBefore', 'ConstructorChampionshipPosition'
+        ]],
+        left_on=['Year', 'Round', 'Abbreviation'],
+        right_on=['Year', 'Round', 'DriverAbbr'],
+        how='left'
+    )
+
+    return merged
+
+
+def calculate_track_history(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate historical performance at each track.
+    Average finishing position at this circuit in previous races.
+    """
+    df = df.sort_values(['Year', 'Round']).copy()
+
+    # Group by driver and circuit
+    track_avg = []
+
+    for idx, row in df.iterrows():
+        driver = row['Abbreviation']
+        circuit = row.get('CircuitName', row.get('EventName', 'Unknown'))
+        year = row['Year']
+        round_num = row['Round']
+
+        # Get all previous races at this circuit for this driver
+        prev_races = df[
+            (df['Abbreviation'] == driver) &
+            (df.get('CircuitName', df.get('EventName', 'Unknown')) == circuit) &
+            ((df['Year'] < year) | ((df['Year'] == year) & (df['Round'] < round_num)))
+        ]
+
+        if len(prev_races) > 0:
+            avg_pos = prev_races['Position'].mean()
+        else:
+            avg_pos = np.nan  # No history
+
+        track_avg.append(avg_pos)
+
+    df['TrackHistoryAvgPosition'] = track_avg
+
+    return df
+
+
+def calculate_recent_form(df: pd.DataFrame, n_races: int = 3) -> pd.DataFrame:
+    """
+    Calculate recent form based on last N races.
+    """
+    df = df.sort_values(['Year', 'Round']).copy()
+
+    recent_form = []
+
+    for idx, row in df.iterrows():
+        driver = row['Abbreviation']
+        year = row['Year']
+        round_num = row['Round']
+
+        # Get previous races for this driver in the same season
+        prev_races = df[
+            (df['Abbreviation'] == driver) &
+            (df['Year'] == year) &
+            (df['Round'] < round_num)
+        ].tail(n_races)
+
+        if len(prev_races) > 0:
+            avg_pos = prev_races['Position'].mean()
+        else:
+            # Look at end of previous season
+            prev_season = df[
+                (df['Abbreviation'] == driver) &
+                (df['Year'] == year - 1)
+            ].tail(n_races)
+
+            if len(prev_season) > 0:
+                avg_pos = prev_season['Position'].mean()
+            else:
+                avg_pos = np.nan
+
+        recent_form.append(avg_pos)
+
+    df['RecentForm'] = recent_form
+
+    return df
+
+
+def calculate_qualifying_gap(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate gap to pole position in qualifying (in seconds).
+    """
+    df = df.copy()
+
+    # If Q3 times exist, calculate gap
+    if 'Q3' in df.columns:
+        # Convert Q3 to timedelta if it's a string
+        if df['Q3'].dtype == object:
+            df['Q3'] = pd.to_timedelta(df['Q3'], errors='coerce')
+
+        # Calculate gap to pole for each race
+        gaps = []
+        for (year, round_num), group in df.groupby(['Year', 'Round']):
+            pole_time = group['Q3'].min()
+            group_gaps = (group['Q3'] - pole_time).dt.total_seconds()
+            gaps.extend(group_gaps.tolist())
+
+        df['QualifyingGapToPole'] = gaps
+    else:
+        df['QualifyingGapToPole'] = np.nan
+
+    return df
+
+
+def create_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create final feature set for ML model.
+    """
+    features = pd.DataFrame()
+
+    # Target variable
+    features['FinishingPosition'] = df['Position']
+
+    # Grid position (most important feature)
+    features['GridPosition'] = df['GridPosition'].fillna(20)  # Pit lane start = 20
+
+    # Championship standings
+    features['DriverChampPosition'] = df.get('DriverChampionshipPosition', np.nan)
+    features['DriverPoints'] = df.get('DriverPointsBefore', 0).fillna(0)
+    features['ConstructorChampPosition'] = df.get('ConstructorChampionshipPosition', np.nan)
+    features['ConstructorPoints'] = df.get('ConstructorPointsBefore', 0).fillna(0)
+
+    # Track history
+    features['TrackHistoryAvgPos'] = df.get('TrackHistoryAvgPosition', np.nan)
+
+    # Recent form
+    features['RecentForm'] = df.get('RecentForm', np.nan)
+
+    # Qualifying gap
+    features['QualifyingGap'] = df.get('QualifyingGapToPole', np.nan)
+
+    # Metadata (for reference, not features)
+    features['Year'] = df['Year']
+    features['Round'] = df['Round']
+    features['Driver'] = df['Abbreviation']
+    features['Team'] = df['TeamName']
+    features['EventName'] = df.get('EventName', 'Unknown')
+
+    return features
+
+
+def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Handle missing values in features.
+    """
+    df = df.copy()
+
+    # Fill championship positions with worst case (20)
+    df['DriverChampPosition'] = df['DriverChampPosition'].fillna(20)
+    df['ConstructorChampPosition'] = df['ConstructorChampPosition'].fillna(10)
+
+    # Fill track history with median grid position
+    df['TrackHistoryAvgPos'] = df['TrackHistoryAvgPos'].fillna(df['GridPosition'])
+
+    # Fill recent form with grid position
+    df['RecentForm'] = df['RecentForm'].fillna(df['GridPosition'])
+
+    # Fill qualifying gap with large value for those not in Q3
+    df['QualifyingGap'] = df['QualifyingGap'].fillna(5.0)  # 5 seconds default
+
+    return df
+
+
+def prepare_training_data(prefix: str = DEFAULT_DATA_PREFIX) -> pd.DataFrame:
+    """
+    Full pipeline to prepare training data.
+    """
+    logger.info("Loading raw data...")
+    data = load_raw_data(prefix)
+
+    if data['races'].empty:
+        raise ValueError("No race data found!")
+
+    logger.info("Merging race and qualifying data...")
+    df = merge_race_qualifying(data['races'], data['qualifying'])
+
+    logger.info("Adding standings information...")
+    df = add_standings(df, data['standings'])
+
+    logger.info("Calculating track history...")
+    df = calculate_track_history(df)
+
+    logger.info("Calculating recent form...")
+    df = calculate_recent_form(df)
+
+    logger.info("Calculating qualifying gaps...")
+    df = calculate_qualifying_gap(df)
+
+    logger.info("Creating feature set...")
+    features = create_features(df)
+
+    logger.info("Filling missing values...")
+    features = fill_missing_values(features)
+
+    # Remove rows with missing target
+    features = features.dropna(subset=['FinishingPosition'])
+
+    # Save processed features
+    output_path = DATA_DIR / f"{prefix}_features.csv"
+    features.to_csv(output_path, index=False)
+    logger.info(f"Saved features to {output_path}")
+
+    return features
+
+
+def get_feature_columns() -> list:
+    """Return list of feature columns for model training."""
+    return [
+        'GridPosition',
+        'DriverChampPosition',
+        'DriverPoints',
+        'ConstructorChampPosition',
+        'ConstructorPoints',
+        'TrackHistoryAvgPos',
+        'RecentForm',
+        'QualifyingGap'
+    ]
+
+
+def get_metadata_columns() -> list:
+    """Return list of metadata columns (not used for training)."""
+    return ['Year', 'Round', 'Driver', 'Team', 'EventName']
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Prepare ML features from collected F1 data")
+    parser.add_argument('--prefix', type=str, default=DEFAULT_DATA_PREFIX, help='Input/output filename prefix')
+    args = parser.parse_args()
+
+    features = prepare_training_data(args.prefix)
+
+    print("\n" + "="*50)
+    print("FEATURE ENGINEERING COMPLETE")
+    print("="*50)
+    print(f"Total samples: {len(features)}")
+    print(f"\nFeature columns: {get_feature_columns()}")
+    print(f"\nSample data:")
+    print(features[get_feature_columns() + ['FinishingPosition']].head(10))
+    print("\nFeature statistics:")
+    print(features[get_feature_columns()].describe())
