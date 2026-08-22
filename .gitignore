@@ -17,6 +17,7 @@ dist/
 .ipynb_checkpoints/
 
 # Data & Cache (large files)
+data/*.csv
 data/cache/
 *.pkl
 *.joblib
