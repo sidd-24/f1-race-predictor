@@ -170,9 +170,8 @@ Add screenshots of the terminal output below. Store the image files in `docs/scr
 
 ### Race Prediction
 
-<!-- Add docs/screenshots/race-prediction.png, then uncomment:
 ![Race prediction output](docs/screenshots/race-prediction.png)
--->
+
 
 Example command:
 
@@ -182,9 +181,9 @@ python -m src.predictor --next --year auto --next-mode auto
 
 ### Current Standings
 
-<!-- Add docs/screenshots/current-standings.png, then uncomment:
+
 ![Current standings output](docs/screenshots/current-standings.png)
--->
+
 
 Example command:
 
