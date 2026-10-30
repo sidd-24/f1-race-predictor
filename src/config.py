@@ -33,7 +33,7 @@ FEATURE_COLUMNS = [
     'driver_points',
     'constructor_points',
     'track_driver_avg_position',    # Historical performance at track
-    'recent_form',                   # Average position in last 3 races
+    'recent_form',                   # Weighted average position in last 3 races
     'qualifying_gap_to_pole',        # Time gap to pole in qualifying
     'is_home_race',                  # Driver's home GP
 ]

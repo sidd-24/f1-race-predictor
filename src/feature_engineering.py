@@ -27,8 +27,20 @@ def load_raw_data(prefix: str = DEFAULT_DATA_PREFIX) -> dict:
     for key in ['races', 'qualifying', 'standings']:
         filepath = DATA_DIR / f"{prefix}_{key}.csv"
         if filepath.exists():
-            data[key] = pd.read_csv(filepath)
-            logger.info(f"Loaded {len(data[key])} rows from {filepath.name}")
+            df = pd.read_csv(filepath)
+            
+            # Force critical columns to numeric to prevent TypeError during calculations
+            # 'Position' is used in track history and recent form
+            if 'Position' in df.columns:
+                df['Position'] = pd.to_numeric(df['Position'], errors='coerce')
+            
+            # 'Year' and 'Round' are used for filtering and merging
+            for col in ['Year', 'Round']:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+            data[key] = df
+            logger.info(f"Loaded {len(df)} rows from {filepath.name}")
         else:
             logger.warning(f"File not found: {filepath}")
             data[key] = pd.DataFrame()
@@ -39,6 +51,13 @@ def merge_race_qualifying(races: pd.DataFrame, qualifying: pd.DataFrame) -> pd.D
     """Merge race results with qualifying data."""
     if races.empty or qualifying.empty:
         return races
+
+    # Ensure merge keys are the same type to avoid ValueError
+    races = races.copy()
+    qualifying = qualifying.copy()
+    for col in ['Year', 'Round']:
+        races[col] = pd.to_numeric(races[col], errors='coerce')
+        qualifying[col] = pd.to_numeric(qualifying[col], errors='coerce')
 
     # Standardize column names for merging
     qualifying_clean = qualifying.rename(columns={
@@ -117,10 +136,14 @@ def calculate_track_history(df: pd.DataFrame) -> pd.DataFrame:
 
 def calculate_recent_form(df: pd.DataFrame, n_races: int = 3) -> pd.DataFrame:
     """
-    Calculate recent form based on last N races.
+    Calculate recent form based on last N races using a weighted average.
+    More recent races have a higher impact on the form score.
     """
     df = df.sort_values(['Year', 'Round']).copy()
 
+    # Weights for the last 3 races: [most_recent, second_most, third_most]
+    WEIGHTS = np.array([0.5, 0.3, 0.2])
+    
     recent_form = []
 
     for idx, row in df.iterrows():
@@ -135,19 +158,24 @@ def calculate_recent_form(df: pd.DataFrame, n_races: int = 3) -> pd.DataFrame:
             (df['Round'] < round_num)
         ].tail(n_races)
 
-        if len(prev_races) > 0:
-            avg_pos = prev_races['Position'].mean()
-        else:
+        if len(prev_races) == 0:
             # Look at end of previous season
-            prev_season = df[
+            prev_races = df[
                 (df['Abbreviation'] == driver) &
                 (df['Year'] == year - 1)
             ].tail(n_races)
 
-            if len(prev_season) > 0:
-                avg_pos = prev_season['Position'].mean()
-            else:
-                avg_pos = np.nan
+        if len(prev_races) > 0:
+            # Get positions in reverse order (most recent first)
+            positions = prev_races['Position'].values[::-1]
+            
+            # Adjust weights if we have fewer than n_races
+            current_weights = WEIGHTS[:len(positions)]
+            normalized_weights = current_weights / current_weights.sum()
+            
+            avg_pos = np.average(positions, weights=normalized_weights)
+        else:
+            avg_pos = np.nan
 
         recent_form.append(avg_pos)
 

@@ -46,7 +46,8 @@ Run commands from the project root (`f1-race-predictor`). The normal workflow is
 
 ```bash
 # 1. Collect completed seasons. The range is inclusive.
-python -m src.data_collector --start-year 2019 --end-year 2025 --prefix f1_data
+# Existing rows are reused; only missing race/qualifying sessions are downloaded.
+python -m src.data_collector --start-year 2019 --end-year 2026 --prefix f1_data
 
 # 2. Build model-ready features.
 python -m src.feature_engineering --prefix f1_data
@@ -58,6 +59,10 @@ python -m src.model --prefix f1_data
 python -m src.predictor --next --year auto --data-prefix f1_data --next-mode auto
 ```
 
+The automatic prediction uses local qualifying data when available. Before
+qualifying, it uses the standings-based prediction and does not reload all
+previous race sessions.
+
 Use the current calendar year when collecting the latest available data:
 
 ```bash
@@ -65,6 +70,25 @@ python -m src.data_collector --start-year 2019 --end-year 2026 --prefix f1_data
 ```
 
 The collector skips future events and only requests sessions for completed race dates.
+When rerun with the same prefix, it loads the existing race and qualifying CSV
+files and checks each `(Year, Round)` before making a FastF1 session request.
+Existing sessions are skipped, newly available sessions are added, and duplicate
+rows are removed. FastF1's cache is still used for API responses such as schedules.
+Sessions that FastF1 reports as unavailable are recorded in
+`f1_data_unavailable_sessions.csv` and skipped on later runs. Use
+`--retry-failed` when you want to retry those sessions after data is published.
+FastF1 request logs are quiet by default; add `--debug` to the collector or
+predictor command when detailed API diagnostics are needed.
+Race CSV files contain only race-result fields. Qualifying CSV files retain qualifying times because
+the feature pipeline uses them to calculate the gap to pole.
+CSV rows are saved in chronological order by season and round, then finishing
+or qualifying position.
+Training validates required columns, numeric feature values, finishing
+positions, duplicate driver/race rows, and unusually incomplete races before
+fitting.
+Pre-qualifying predictions use the latest completed race to identify the
+current driver roster, so replacement drivers from earlier rounds are not
+carried into a prediction; the grid is capped at 22 drivers.
 
 ## Prediction Commands
 
@@ -110,7 +134,7 @@ Standings are calculated from completed race results up to the date the command 
 
 ```bash
 python -m src.predictor --current-standings --year 2026
-python -m src.predictor --current-standings --year auto
+C
 ```
 
 The output includes driver position, driver points, constructor position, and constructor points. If no completed races are available for the selected year, the command reports that standings are unavailable.

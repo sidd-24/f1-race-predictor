@@ -35,6 +35,15 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 # Enable FastF1 cache
 fastf1.Cache.enable_cache(str(FASTF1_CACHE_DIR))
 
+RACE_COLUMNS_TO_DROP = ['HeadshotUrl', 'Q1', 'Q2', 'Q3']
+
+
+def configure_logging(debug: bool = False) -> None:
+    """Reduce FastF1's repeated internal request logs unless debugging."""
+    level = logging.DEBUG if debug else logging.WARNING
+    for logger_name in ('fastf1', 'fastf1.api', 'fastf1.req', 'requests_cache'):
+        logging.getLogger(logger_name).setLevel(level)
+
 
 def get_event_schedule(year: int) -> pd.DataFrame:
     """Get the race schedule for a given year."""
@@ -65,6 +74,7 @@ def get_race_results(year: int, round_number: int) -> pd.DataFrame:
         # Clean up position data
         results['Position'] = pd.to_numeric(results['Position'], errors='coerce')
         results['GridPosition'] = pd.to_numeric(results['GridPosition'], errors='coerce')
+        results = results.drop(columns=RACE_COLUMNS_TO_DROP, errors='ignore')
 
         return results
 
@@ -116,7 +126,54 @@ def get_driver_standings(year: int, round_number: int = None) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def collect_season_data(year: int) -> dict:
+def _existing_event_keys(data: pd.DataFrame) -> set:
+    """Return (year, round) keys already present in a collected dataset."""
+    if data.empty or not {'Year', 'Round'}.issubset(data.columns):
+        return set()
+
+    normalized = data[['Year', 'Round']].copy()
+    normalized['Year'] = pd.to_numeric(normalized['Year'], errors='coerce')
+    normalized['Round'] = pd.to_numeric(normalized['Round'], errors='coerce')
+    normalized = normalized.dropna().astype(int).drop_duplicates()
+    return set(zip(normalized['Year'], normalized['Round']))
+
+
+def _clean_collected_data(data: pd.DataFrame) -> pd.DataFrame:
+    """Remove repeated CSV headers and invalid event keys from existing data."""
+    if data.empty or not {'Year', 'Round'}.issubset(data.columns):
+        return data
+
+    cleaned = data.copy()
+    cleaned['Year'] = pd.to_numeric(cleaned['Year'], errors='coerce')
+    cleaned['Round'] = pd.to_numeric(cleaned['Round'], errors='coerce')
+    cleaned = cleaned.dropna(subset=['Year', 'Round'])
+    cleaned['Year'] = cleaned['Year'].astype(int)
+    cleaned['Round'] = cleaned['Round'].astype(int)
+    return cleaned.reset_index(drop=True)
+
+
+def _load_unavailable_sessions(filename_prefix: str) -> set:
+    """Load sessions that previously returned no data."""
+    path = DATA_DIR / f"{filename_prefix}_unavailable_sessions.csv"
+    if not path.exists():
+        return set()
+    data = pd.read_csv(path)
+    if not {'Year', 'Round', 'Session'}.issubset(data.columns):
+        return set()
+    return {
+        (int(row.Year), int(row.Round), row.Session)
+        for row in data.itertuples(index=False)
+        if pd.notna(row.Year) and pd.notna(row.Round)
+    }
+
+
+def collect_season_data(
+    year: int,
+    existing_races: pd.DataFrame = None,
+    existing_qualifying: pd.DataFrame = None,
+    unavailable_sessions: set = None,
+    retry_failed: bool = False
+) -> dict:
     """Collect all race and qualifying data for a season."""
     logger.info(f"Collecting data for {year} season...")
 
@@ -124,30 +181,71 @@ def collect_season_data(year: int) -> dict:
     if schedule.empty:
         return {'races': pd.DataFrame(), 'qualifying': pd.DataFrame()}
 
+    existing_races = existing_races if existing_races is not None else pd.DataFrame()
+    existing_qualifying = existing_qualifying if existing_qualifying is not None else pd.DataFrame()
+    if unavailable_sessions is None:
+        unavailable_sessions = set()
+    existing_race_keys = _existing_event_keys(existing_races)
+    existing_qualifying_keys = _existing_event_keys(existing_qualifying)
+
     races = []
     qualifying = []
 
     # Get number of completed races
     completed_rounds = schedule[schedule['EventDate'] < pd.Timestamp.now()]['RoundNumber'].tolist()
+    skipped_races = 0
+    skipped_qualifying = 0
+    missing_races = 0
+    missing_qualifying = 0
 
     for round_num in tqdm(completed_rounds, desc=f"Processing {year}"):
-        # Get race results
-        race_result = get_race_results(year, round_num)
-        if not race_result.empty:
-            races.append(race_result)
+        event_key = (year, int(round_num))
 
-        # Get qualifying results
-        quali_result = get_qualifying_results(year, round_num)
-        if not quali_result.empty:
-            qualifying.append(quali_result)
+        race_unavailable = (year, int(round_num), 'race') in unavailable_sessions
+        qualifying_unavailable = (year, int(round_num), 'qualifying') in unavailable_sessions
+
+        if event_key in existing_race_keys or (race_unavailable and not retry_failed):
+            skipped_races += 1
+        else:
+            missing_races += 1
+            race_result = get_race_results(year, round_num)
+            if not race_result.empty:
+                races.append(race_result)
+            else:
+                unavailable_sessions.add((year, int(round_num), 'race'))
+
+        if event_key in existing_qualifying_keys or (qualifying_unavailable and not retry_failed):
+            skipped_qualifying += 1
+        else:
+            missing_qualifying += 1
+            quali_result = get_qualifying_results(year, round_num)
+            if not quali_result.empty:
+                qualifying.append(quali_result)
+            else:
+                unavailable_sessions.add((year, int(round_num), 'qualifying'))
+
+    logger.info(
+        "%s: skipped %d existing race sessions and %d existing qualifying sessions; "
+        "fetching %d missing race sessions and %d missing qualifying sessions",
+        year,
+        skipped_races,
+        skipped_qualifying,
+        missing_races,
+        missing_qualifying,
+    )
 
     return {
         'races': pd.concat(races, ignore_index=True) if races else pd.DataFrame(),
-        'qualifying': pd.concat(qualifying, ignore_index=True) if qualifying else pd.DataFrame()
+        'qualifying': pd.concat(qualifying, ignore_index=True) if qualifying else pd.DataFrame(),
+        'unavailable_sessions': unavailable_sessions
     }
 
 
-def collect_all_data(seasons: list = None) -> dict:
+def collect_all_data(
+    seasons: list = None,
+    filename_prefix: str = DEFAULT_DATA_PREFIX,
+    retry_failed: bool = False
+) -> dict:
     """
     Collect data for multiple seasons.
 
@@ -157,11 +255,26 @@ def collect_all_data(seasons: list = None) -> dict:
     if seasons is None:
         seasons = SEASONS
 
-    all_races = []
-    all_qualifying = []
+    existing_data = load_data(filename_prefix)
+    unavailable_sessions = _load_unavailable_sessions(filename_prefix)
+    existing_data['races'] = _clean_collected_data(existing_data['races'])
+    existing_data['races'] = existing_data['races'].drop(
+        columns=RACE_COLUMNS_TO_DROP,
+        errors='ignore'
+    )
+    existing_data['qualifying'] = _clean_collected_data(existing_data['qualifying'])
+    existing_data['standings'] = _clean_collected_data(existing_data['standings'])
+    all_races = [existing_data['races']] if not existing_data['races'].empty else []
+    all_qualifying = [existing_data['qualifying']] if not existing_data['qualifying'].empty else []
 
     for year in seasons:
-        season_data = collect_season_data(year)
+        season_data = collect_season_data(
+            year,
+            existing_races=existing_data['races'],
+            existing_qualifying=existing_data['qualifying'],
+            unavailable_sessions=unavailable_sessions,
+            retry_failed=retry_failed
+        )
 
         if not season_data['races'].empty:
             all_races.append(season_data['races'])
@@ -170,8 +283,21 @@ def collect_all_data(seasons: list = None) -> dict:
 
     result = {
         'races': pd.concat(all_races, ignore_index=True) if all_races else pd.DataFrame(),
-        'qualifying': pd.concat(all_qualifying, ignore_index=True) if all_qualifying else pd.DataFrame()
+        'qualifying': pd.concat(all_qualifying, ignore_index=True) if all_qualifying else pd.DataFrame(),
+        'unavailable_sessions': pd.DataFrame(
+            list(unavailable_sessions),
+            columns=['Year', 'Round', 'Session']
+        )
     }
+
+    for key in ('races', 'qualifying'):
+        if not result[key].empty and {'Year', 'Round'}.issubset(result[key].columns):
+            result[key] = result[key].drop_duplicates(
+                subset=['Year', 'Round', 'Abbreviation']
+                if 'Abbreviation' in result[key].columns
+                else ['Year', 'Round'],
+                keep='last'
+            ).reset_index(drop=True)
 
     logger.info(f"Collected {len(result['races'])} race results")
     logger.info(f"Collected {len(result['qualifying'])} qualifying results")
@@ -265,12 +391,26 @@ def compute_standings(race_results: pd.DataFrame) -> pd.DataFrame:
 
 
 def save_data(data: dict, filename_prefix: str = "f1_data"):
-    """Save collected data to CSV files."""
+    """Save the complete merged datasets to CSV files."""
     for key, df in data.items():
-        if not df.empty:
-            filepath = DATA_DIR / f"{filename_prefix}_{key}.csv"
-            df.to_csv(filepath, index=False)
-            logger.info(f"Saved {key} data to {filepath}")
+        if df.empty:
+            continue
+
+        filepath = DATA_DIR / f"{filename_prefix}_{key}.csv"
+        if key == 'races':
+            df = df.drop(columns=RACE_COLUMNS_TO_DROP, errors='ignore')
+        sort_columns = [
+            column for column in ('Year', 'Round', 'Position', 'QualifyingPosition')
+            if column in df.columns
+        ]
+        if sort_columns:
+            df = df.copy()
+            for column in ('Year', 'Round', 'Position', 'QualifyingPosition'):
+                if column in df.columns:
+                    df[column] = pd.to_numeric(df[column], errors='coerce')
+            df = df.sort_values(sort_columns, na_position='last').reset_index(drop=True)
+        df.to_csv(filepath, index=False)
+        logger.info(f"Saved {key} data to {filepath}")
 
 
 def load_data(filename_prefix: str = "f1_data") -> dict:
@@ -299,14 +439,21 @@ def main():
         help='End season year (inclusive)'
     )
     parser.add_argument('--prefix', type=str, default=DEFAULT_DATA_PREFIX, help='Output filename prefix')
+    parser.add_argument(
+        '--retry-failed',
+        action='store_true',
+        help='Retry sessions previously marked unavailable by FastF1'
+    )
+    parser.add_argument('--debug', action='store_true', help='Show detailed FastF1 request logs')
     args = parser.parse_args()
+    configure_logging(args.debug)
 
     seasons = build_seasons(args.start_year, args.end_year)
 
     logger.info("Starting F1 data collection...")
 
     # Collect race and qualifying data
-    data = collect_all_data(seasons)
+    data = collect_all_data(seasons, args.prefix, args.retry_failed)
 
     # Compute standings
     if not data['races'].empty:

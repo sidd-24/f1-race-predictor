@@ -26,6 +26,13 @@ DEFAULT_DATA_PREFIX = "f1_data"
 fastf1.Cache.enable_cache(str(FASTF1_CACHE_DIR))
 
 
+def configure_fastf1_logging(debug: bool = False) -> None:
+    """Keep FastF1 internals quiet unless detailed diagnostics are requested."""
+    level = logging.DEBUG if debug else logging.WARNING
+    for logger_name in ('fastf1', 'fastf1.api', 'fastf1.req', 'requests_cache'):
+        logging.getLogger(logger_name).setLevel(level)
+
+
 def resolve_data_file(prefix: str, key: str) -> Path:
     """
     Resolve a data file path using the selected prefix, with legacy fallback.
@@ -58,7 +65,10 @@ def resolve_cli_year(year_arg: str, parser: argparse.ArgumentParser) -> int:
     return pd.Timestamp.now().year
 
 
-def get_current_standings(year: int) -> pd.DataFrame:
+def get_current_standings(
+    year: int,
+    data_prefix: str = DEFAULT_DATA_PREFIX
+) -> pd.DataFrame:
     """
     Get live driver and constructor standings as of today.
     Calculated from completed race results in the selected season.
@@ -76,17 +86,33 @@ def get_current_standings(year: int) -> pd.DataFrame:
         logger.warning(f"No completed races in {year}")
         return pd.DataFrame()
 
-    # Collect all race results
-    races = []
-    for round_num in completed_rounds:
-        result = get_race_results(year, round_num)
-        if not result.empty:
-            races.append(result)
+    # Prefer the locally collected dataset to avoid reloading every session.
+    races_path = resolve_data_file(data_prefix, "races")
+    all_races = pd.DataFrame()
+    if races_path.exists():
+        local_races = pd.read_csv(races_path)
+        local_races['Year'] = pd.to_numeric(local_races['Year'], errors='coerce')
+        local_races['Round'] = pd.to_numeric(local_races['Round'], errors='coerce')
+        all_races = local_races[
+            (local_races['Year'] == year) &
+            (local_races['Round'].isin(pd.to_numeric(completed_rounds)))
+        ].copy()
 
-    if not races:
-        return pd.DataFrame()
+    if all_races.empty:
+        logger.warning(
+            "No local race data found for %s in %s; fetching completed results.",
+            year,
+            races_path.name
+        )
+        races = []
+        for round_num in completed_rounds:
+            result = get_race_results(year, round_num)
+            if not result.empty:
+                races.append(result)
 
-    all_races = pd.concat(races, ignore_index=True)
+        if not races:
+            return pd.DataFrame()
+        all_races = pd.concat(races, ignore_index=True)
 
     # Use official points from race results when available.
     if 'Points' in all_races.columns:
@@ -133,9 +159,9 @@ def get_current_standings(year: int) -> pd.DataFrame:
     return standings.sort_values('DriverChampionshipPosition').reset_index(drop=True)
 
 
-def display_current_standings(year: int):
+def display_current_standings(year: int, data_prefix: str = DEFAULT_DATA_PREFIX):
     """Display live championship standings based on completed races up to today."""
-    standings = get_current_standings(year)
+    standings = get_current_standings(year, data_prefix)
     if standings.empty:
         print(f"No standings available yet for {year}.")
         return None
@@ -189,6 +215,10 @@ def calculate_driver_track_history(driver: str, circuit: str, races_df: pd.DataF
     if races_df.empty:
         return np.nan
 
+    # Ensure Position is numeric
+    races_df = races_df.copy()
+    races_df['Position'] = pd.to_numeric(races_df['Position'], errors='coerce')
+
     driver_races = races_df[
         (races_df['Abbreviation'] == driver) &
         (races_df['EventName'].str.contains(circuit, case=False, na=False))
@@ -203,6 +233,10 @@ def calculate_recent_form(driver: str, races_df: pd.DataFrame, n_races: int = 3)
     """Calculate driver's average position in last N races."""
     if races_df.empty:
         return np.nan
+
+    # Ensure Position is numeric
+    races_df = races_df.copy()
+    races_df['Position'] = pd.to_numeric(races_df['Position'], errors='coerce')
 
     driver_races = races_df[races_df['Abbreviation'] == driver].tail(n_races)
 
@@ -222,7 +256,7 @@ def prepare_prediction_features(year: int, round_number: int, data_prefix: str =
         return pd.DataFrame()
 
     # Get current standings
-    standings = get_current_standings(year)
+    standings = get_current_standings(year, data_prefix)
 
     # Get historical race data
     historical_path = resolve_data_file(data_prefix, "races")
@@ -323,6 +357,7 @@ def display_predictions(results: pd.DataFrame, event_name: str = "Race"):
     """Display predictions in a formatted table."""
     print("\n" + "=" * 70)
     print(f"[F1] RACE PREDICTION: {event_name}")
+    print("Note: This is a prediction based on current data and ML models.")
     print("=" * 70)
     print(f"{'Pos':<5}{'Driver':<25}{'Team':<25}{'Grid':<8}")
     print("-" * 70)
@@ -428,7 +463,10 @@ def compare_predictions(results: pd.DataFrame, event_name: str = "Race"):
     print("=" * 80)
 
 
-def get_next_race_info(year: int = None):
+def get_next_race_info(
+    year: int = None,
+    data_prefix: str = DEFAULT_DATA_PREFIX
+):
     """
     Get information about the next upcoming race.
 
@@ -461,16 +499,27 @@ def get_next_race_info(year: int = None):
     event_name = next_race['EventName']
     event_date = next_race['EventDate']
 
-    # Check if qualifying has happened (usually Saturday before race)
+    qualifying_path = resolve_data_file(data_prefix, "qualifying")
+    qualifying_available = False
+    if qualifying_path.exists():
+        qualifying = pd.read_csv(qualifying_path, usecols=['Year', 'Round'])
+        qualifying_available = (
+            ((pd.to_numeric(qualifying['Year'], errors='coerce') == year) &
+             (pd.to_numeric(qualifying['Round'], errors='coerce') == round_number))
+            .any()
+        )
+
+    # The local dataset is authoritative; the date is only a fallback hint.
     quali_date = event_date - pd.Timedelta(days=1)
-    qualifying_available = now >= quali_date
+    qualifying_date_reached = now >= quali_date
 
     return {
         'year': year,
         'round': round_number,
         'event_name': event_name,
         'event_date': event_date,
-        'qualifying_available': qualifying_available
+        'qualifying_available': qualifying_available,
+        'qualifying_date_reached': qualifying_date_reached
     }
 
 
@@ -525,18 +574,54 @@ def resolve_race_query(race_query: str, default_year: int) -> dict:
     raise ValueError(f"No race named '{query}' found in {year} schedule.")
 
 
-def build_prediction_from_standings(year: int, model_name: str = "best_model") -> pd.DataFrame:
+def build_prediction_from_standings(
+    year: int,
+    model_name: str = "best_model",
+    data_prefix: str = DEFAULT_DATA_PREFIX
+) -> pd.DataFrame:
     """Build prediction dataframe using championship standings as an estimated grid."""
     model = load_model(model_name)
 
-    standings = get_current_standings(year)
+    standings = get_current_standings(year, data_prefix)
     if standings.empty:
-        standings = get_current_standings(year - 1)
+        standings = get_current_standings(year - 1, data_prefix)
 
     if standings.empty:
         return pd.DataFrame()
 
     standings = standings.sort_values('DriverChampionshipPosition')
+    standings_year = int(standings['Year'].iloc[0])
+
+    # Season standings can include replacement drivers who no longer have a
+    # seat. Use the latest completed race to identify the current race roster.
+    races_path = resolve_data_file(data_prefix, "races")
+    if races_path.exists():
+        races = pd.read_csv(races_path)
+        races['Year'] = pd.to_numeric(races['Year'], errors='coerce')
+        races['Round'] = pd.to_numeric(races['Round'], errors='coerce')
+        latest_round = standings['Round'].max()
+        available_rounds = races.loc[
+            (races['Year'] == standings_year) &
+            (races['Round'] <= latest_round),
+            'Round'
+        ].dropna()
+        if not available_rounds.empty:
+            latest_round = available_rounds.max()
+        latest_race = races[
+            (races['Year'] == standings_year) &
+            (races['Round'] == latest_round)
+        ]
+        active_drivers = latest_race['Abbreviation'].dropna().astype(str).unique()
+        if len(active_drivers) > 0:
+            standings = standings[standings['Driver'].isin(active_drivers)]
+
+    # F1's current maximum grid size is 22 cars.
+    if len(standings) > 22:
+        logger.warning(
+            "Limiting standings-based prediction from %d to 22 drivers.",
+            len(standings)
+        )
+        standings = standings.head(22)
 
     features = []
     for grid_pos, (_, row) in enumerate(standings.iterrows(), 1):
@@ -579,7 +664,7 @@ def predict_next_race(
     print("[F1] FINDING NEXT RACE...")
     print("=" * 70)
 
-    race_info = get_next_race_info(year)
+    race_info = get_next_race_info(year, data_prefix)
 
     if race_info is None:
         print("Could not find upcoming race information.")
@@ -595,7 +680,11 @@ def predict_next_race(
     if mode == "standings":
         print("\nUsing standings-based mode (pre-qualifying strategy).")
         print("-" * 70)
-        results = build_prediction_from_standings(race_info['year'], model_name)
+        results = build_prediction_from_standings(
+            race_info['year'],
+            model_name,
+            data_prefix
+        )
         if not results.empty:
             display_predictions(results, f"{race_info['event_name']} (Pre-Qualifying)")
             return results
@@ -625,11 +714,23 @@ def predict_next_race(
                 model_name,
                 data_prefix
             )
+            if results.empty:
+                print("\nQualifying data could not be loaded.")
+                print("Falling back to standings-based pre-qualifying prediction.")
+                results = build_prediction_from_standings(
+                    race_info['year'],
+                    model_name,
+                    data_prefix
+                )
         else:
             print("\nQualifying hasn't happened yet.")
             print("Using standings-based pre-qualifying prediction.")
             print("-" * 70)
-            results = build_prediction_from_standings(race_info['year'], model_name)
+            results = build_prediction_from_standings(
+                race_info['year'],
+                model_name,
+                data_prefix
+            )
             if not results.empty:
                 display_predictions(results, f"{race_info['event_name']} (Pre-Qualifying)")
                 return results
@@ -704,7 +805,11 @@ def predict_with_custom_grid(grid_order: list, year: int = 2025, model_name: str
     return results
 
 
-def predict_from_standings(year: int = None, model_name: str = "best_model"):
+def predict_from_standings(
+    year: int = None,
+    model_name: str = "best_model",
+    data_prefix: str = DEFAULT_DATA_PREFIX
+):
     """
     Predict race using championship standings as estimated grid order.
     Use this when qualifying data is not available yet.
@@ -719,7 +824,7 @@ def predict_from_standings(year: int = None, model_name: str = "best_model"):
     if year is None:
         year = pd.Timestamp.now().year
 
-    results = build_prediction_from_standings(year, model_name)
+    results = build_prediction_from_standings(year, model_name, data_prefix)
     if results.empty:
         print("Could not load standings data.")
         return None
@@ -837,8 +942,10 @@ def main():
     )
     parser.add_argument('--standings', action='store_true', help='Predict using championship standings as grid')
     parser.add_argument('--grid', type=str, help='Custom grid order (comma-separated driver codes)')
+    parser.add_argument('--debug', action='store_true', help='Show detailed FastF1 request logs')
 
     args = parser.parse_args()
+    configure_fastf1_logging(args.debug)
     effective_year = resolve_cli_year(args.year, parser)
 
     if args.grid:
@@ -847,7 +954,19 @@ def main():
         results = predict_with_custom_grid(grid_order, effective_year, args.model)
         display_predictions(results, f"Custom Grid Prediction")
     elif args.current_standings:
-        display_current_standings(effective_year)
+        display_current_standings(effective_year, args.data_prefix)
+    elif args.race:
+        try:
+            race_info = resolve_race_query(args.race, effective_year)
+            print("\n" + "=" * 80)
+            print(f"[F1] HISTORICAL ANALYSIS: {race_info['event_name']}")
+            print("Comparing model predictions against the actual race results.")
+            print("=" * 80)
+            results = predict_from_historical(race_info['year'], race_info['round'], args.data_prefix)
+            compare_predictions(results, race_info['event_name'])
+        except ValueError as exc:
+            parser.error(str(exc))
+            return
     elif args.race:
         try:
             race_info = resolve_race_query(args.race, effective_year)
@@ -855,16 +974,12 @@ def main():
             parser.error(str(exc))
             return
 
-        if args.compare:
-            results = predict_from_historical(race_info['year'], race_info['round'], args.data_prefix)
-            compare_predictions(results, race_info['event_name'])
-        else:
-            results = predict_race(race_info['year'], race_info['round'], args.model, args.data_prefix)
-            if not results.empty:
-                display_predictions(results, race_info['event_name'])
+        results = predict_race(race_info['year'], race_info['round'], args.model, args.data_prefix)
+        if not results.empty:
+            display_predictions(results, race_info['event_name'])
     elif args.standings:
         # Predict from championship standings
-        predict_from_standings(effective_year, args.model)
+        predict_from_standings(effective_year, args.model, args.data_prefix)
     elif args.next_race:
         # Predict next upcoming race
         predict_next_race(args.model, args.data_prefix, effective_year, args.next_mode)
