@@ -25,3 +25,6 @@ tqdm>=4.66.0           # Progress bars
 # Development
 jupyter>=1.0.0         # For notebooks
 ipykernel>=6.0.0
+
+# Testing
+pytest>=8.0.0

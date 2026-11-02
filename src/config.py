@@ -25,21 +25,10 @@ MIN_SEASON = 2019  # FastF1 has good data from 2018+
 SEASONS = list(range(MIN_SEASON, datetime.now().year + 1))  # Collect up to current year
 DEFAULT_DATA_PREFIX = "f1_data"
 
-# Feature columns for model
-FEATURE_COLUMNS = [
-    'grid_position',
-    'driver_championship_position',
-    'constructor_championship_position',
-    'driver_points',
-    'constructor_points',
-    'track_driver_avg_position',    # Historical performance at track
-    'recent_form',                   # Weighted average position in last 3 races
-    'qualifying_gap_to_pole',        # Time gap to pole in qualifying
-    'is_home_race',                  # Driver's home GP
-]
+# The model's feature columns are defined in feature_engineering.get_feature_columns()
 
-# Target column
-TARGET_COLUMN = 'finishing_position'
+# How much more the most recent season in the data counts during training
+RECENT_SEASON_WEIGHT = 10.0
 
 # Model settings
 RANDOM_STATE = 42

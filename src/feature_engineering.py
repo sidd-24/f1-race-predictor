@@ -15,10 +15,48 @@ from pathlib import Path
 import logging
 import argparse
 
-from .config import DATA_DIR, FEATURE_COLUMNS, TARGET_COLUMN, DEFAULT_DATA_PREFIX
+from .config import DATA_DIR, DEFAULT_DATA_PREFIX
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Shared by training and prediction so both build features the same way
+BACK_OF_GRID = 20             # pit-lane starts (grid 0 in FastF1) and missing grid slots
+QUALIFYING_GAP_FILL = 5.0     # seconds; used when a driver has no Q3 time
+RECENT_FORM_WEIGHTS = np.array([0.5, 0.3, 0.2])   # most recent race first
+
+
+def clean_grid_position(grid: pd.Series) -> pd.Series:
+    """FastF1 reports a pit-lane start as grid 0, which would look better than pole."""
+    grid = pd.to_numeric(grid, errors='coerce')
+    return grid.mask(grid <= 0).fillna(BACK_OF_GRID)
+
+
+def gap_to_pole(q3_times: pd.Series) -> pd.Series:
+    """Seconds behind the fastest Q3 time of the same session; NaN for drivers without a Q3 time."""
+    q3 = pd.to_timedelta(q3_times, errors='coerce')
+    return (q3 - q3.min()).dt.total_seconds()
+
+
+def weighted_recent_form(positions_most_recent_first) -> float:
+    """Weighted average finishing position over up to the last 3 races (NaN if none)."""
+    positions = np.asarray(positions_most_recent_first, dtype=float)[:len(RECENT_FORM_WEIGHTS)]
+    if len(positions) == 0:
+        return np.nan
+    weights = RECENT_FORM_WEIGHTS[:len(positions)]
+    return float(np.average(positions, weights=weights / weights.sum()))
+
+
+def previous_races(df: pd.DataFrame, driver: str, year: int, round_num: int, n_races: int = 3) -> pd.DataFrame:
+    """
+    A driver's last n races before (year, round), in chronological order.
+    Falls back to the end of the previous season at the start of a season.
+    """
+    driver_rows = df[df['Abbreviation'] == driver].sort_values(['Year', 'Round'])
+    prev = driver_rows[(driver_rows['Year'] == year) & (driver_rows['Round'] < round_num)].tail(n_races)
+    if prev.empty:
+        prev = driver_rows[driver_rows['Year'] == year - 1].tail(n_races)
+    return prev
 
 
 def load_raw_data(prefix: str = DEFAULT_DATA_PREFIX) -> dict:
@@ -141,43 +179,10 @@ def calculate_recent_form(df: pd.DataFrame, n_races: int = 3) -> pd.DataFrame:
     """
     df = df.sort_values(['Year', 'Round']).copy()
 
-    # Weights for the last 3 races: [most_recent, second_most, third_most]
-    WEIGHTS = np.array([0.5, 0.3, 0.2])
-    
     recent_form = []
-
-    for idx, row in df.iterrows():
-        driver = row['Abbreviation']
-        year = row['Year']
-        round_num = row['Round']
-
-        # Get previous races for this driver in the same season
-        prev_races = df[
-            (df['Abbreviation'] == driver) &
-            (df['Year'] == year) &
-            (df['Round'] < round_num)
-        ].tail(n_races)
-
-        if len(prev_races) == 0:
-            # Look at end of previous season
-            prev_races = df[
-                (df['Abbreviation'] == driver) &
-                (df['Year'] == year - 1)
-            ].tail(n_races)
-
-        if len(prev_races) > 0:
-            # Get positions in reverse order (most recent first)
-            positions = prev_races['Position'].values[::-1]
-            
-            # Adjust weights if we have fewer than n_races
-            current_weights = WEIGHTS[:len(positions)]
-            normalized_weights = current_weights / current_weights.sum()
-            
-            avg_pos = np.average(positions, weights=normalized_weights)
-        else:
-            avg_pos = np.nan
-
-        recent_form.append(avg_pos)
+    for _, row in df.iterrows():
+        prev = previous_races(df, row['Abbreviation'], row['Year'], row['Round'], n_races)
+        recent_form.append(weighted_recent_form(prev['Position'].values[::-1]))
 
     df['RecentForm'] = recent_form
 
@@ -190,20 +195,11 @@ def calculate_qualifying_gap(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
 
-    # If Q3 times exist, calculate gap
+    # If Q3 times exist, calculate gap. transform() keeps every gap on its own row;
+    # the previous version appended gaps race by race, which misaligned them when
+    # the rows were not already sorted by (Year, Round).
     if 'Q3' in df.columns:
-        # Convert Q3 to timedelta if it's a string
-        if df['Q3'].dtype == object:
-            df['Q3'] = pd.to_timedelta(df['Q3'], errors='coerce')
-
-        # Calculate gap to pole for each race
-        gaps = []
-        for (year, round_num), group in df.groupby(['Year', 'Round']):
-            pole_time = group['Q3'].min()
-            group_gaps = (group['Q3'] - pole_time).dt.total_seconds()
-            gaps.extend(group_gaps.tolist())
-
-        df['QualifyingGapToPole'] = gaps
+        df['QualifyingGapToPole'] = df.groupby(['Year', 'Round'])['Q3'].transform(gap_to_pole)
     else:
         df['QualifyingGapToPole'] = np.nan
 
@@ -220,7 +216,7 @@ def create_features(df: pd.DataFrame) -> pd.DataFrame:
     features['FinishingPosition'] = df['Position']
 
     # Grid position (most important feature)
-    features['GridPosition'] = df['GridPosition'].fillna(20)  # Pit lane start = 20
+    features['GridPosition'] = clean_grid_position(df['GridPosition'])
 
     # Championship standings
     features['DriverChampPosition'] = df.get('DriverChampionshipPosition', np.nan)
@@ -264,7 +260,7 @@ def fill_missing_values(df: pd.DataFrame) -> pd.DataFrame:
     df['RecentForm'] = df['RecentForm'].fillna(df['GridPosition'])
 
     # Fill qualifying gap with large value for those not in Q3
-    df['QualifyingGap'] = df['QualifyingGap'].fillna(5.0)  # 5 seconds default
+    df['QualifyingGap'] = df['QualifyingGap'].fillna(QUALIFYING_GAP_FILL)
 
     return df
 

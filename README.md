@@ -121,12 +121,25 @@ python -m src.predictor --grid "VER,NOR,LEC,HAM,PIA,RUS,ALO,SAI,GAS,ALB,OCO,STR,
 python -m src.predictor --race "Monaco Grand Prix" --year 2025 --model xgboost
 ```
 
-To compare a historical prediction with the actual result, use collected feature data:
+`--race` decides automatically: a race that is already in the collected data is compared with its actual result, and an upcoming race is predicted from its qualifying grid. When a compared race was part of the training data, the output says so, because the model has effectively seen that result.
 
 ```bash
-python -m src.predictor --race "Monaco Grand Prix 2023" --compare --data-prefix f1_data
+python -m src.predictor --race "Monaco Grand Prix 2023"
 python -m src.predictor --year 2023 --round 6 --compare --data-prefix f1_data
 ```
+
+## How accurate is it?
+
+On the newest 20% of races (held out from training, 33 races), compared with simply predicting that everyone finishes where they started:
+
+| Per race | Model (Random Forest) | "Finish = grid" baseline |
+|---|---|---|
+| Mean absolute error (positions) | 3.67 | 3.64 |
+| Rank correlation with the result (Spearman) | 0.63 | 0.62 |
+| Winner predicted correctly | 58% | 67% |
+| Podium drivers predicted (share of 3) | 62% | 68% |
+
+So the model currently performs **about as well as the starting grid**, which is a strong baseline in F1. Treat predictions as an estimate, not a forecast with an edge.
 
 ## Current Standings
 
@@ -134,7 +147,6 @@ Standings are calculated from completed race results up to the date the command 
 
 ```bash
 python -m src.predictor --current-standings --year 2026
-C
 ```
 
 The output includes driver position, driver points, constructor position, and constructor points. If no completed races are available for the selected year, the command reports that standings are unavailable.
@@ -183,7 +195,7 @@ f1-race-predictor/
 │   ├── feature_engineering.py
 │   ├── model.py             # Training, evaluation, and serialization
 │   └── predictor.py         # Race predictions and CLI
-├── tests/                   # Automated tests
+├── tests/                   # Tests on synthetic data (no FastF1 download): pytest
 ├── requirements.txt
 └── README.md
 ```

@@ -25,6 +25,7 @@ from .config import (
     CV_FOLDS,
     XGBOOST_PARAMS,
     RANDOM_FOREST_PARAMS,
+    RECENT_SEASON_WEIGHT,
     DEFAULT_DATA_PREFIX
 )
 from .feature_engineering import get_feature_columns, get_metadata_columns
@@ -88,12 +89,11 @@ def prepare_xy(df: pd.DataFrame) -> tuple:
     y = df['FinishingPosition'].copy()
     metadata = df[metadata_cols].copy()
 
-    # Sample Weighting for Regulation Changes
-    # Give significantly more weight to the most recent season
-    # we assume 'Year' is available in metadata or the original df
-    # Since prepare_xy takes df, we can access it
-    current_year = 2026 
-    weights = np.where(df['Year'] == current_year, 10.0, 1.0)
+    # Sample weighting for regulation changes: the most recent season in the
+    # data counts more (previously hardcoded to 2026, which silently stops
+    # working once a new season starts)
+    latest_season = df['Year'].max()
+    weights = np.where(df['Year'] == latest_season, RECENT_SEASON_WEIGHT, 1.0)
 
     return X, y, metadata, weights
 
@@ -290,15 +290,19 @@ def train_and_evaluate(prefix: str = DEFAULT_DATA_PREFIX):
 
 def predict_positions(model, X: pd.DataFrame) -> np.ndarray:
     """
-    Make predictions with trained model.
+    Predict the finishing order of ONE race.
 
-    Returns:
-        Predicted positions (rounded and clipped to 1-20)
+    The regressor outputs a score per driver (lower = further ahead). Scores
+    are turned into distinct positions 1..N; equal scores are broken by grid
+    position. Rounding the raw scores, as before, could give two drivers the
+    same position.
     """
-    predictions = model.predict(X)
-    # Round and clip to valid position range
-    predictions = np.round(predictions).clip(1, 20).astype(int)
-    return predictions
+    scores = np.asarray(model.predict(X), dtype=float)
+    grid = X['GridPosition'].to_numpy() if 'GridPosition' in X else np.zeros(len(X))
+    order = np.lexsort((grid, scores))  # sort by score, then grid
+    positions = np.empty(len(scores), dtype=int)
+    positions[order] = np.arange(1, len(scores) + 1)
+    return positions
 
 
 if __name__ == "__main__":

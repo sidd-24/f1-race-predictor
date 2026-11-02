@@ -12,9 +12,16 @@ import argparse
 import logging
 import re
 
-from .config import FASTF1_CACHE_DIR, DATA_DIR, MODELS_DIR
+from .config import FASTF1_CACHE_DIR, DATA_DIR, MODELS_DIR, TEST_SIZE
 from .model import load_model, predict_positions
-from .feature_engineering import get_feature_columns
+from .feature_engineering import (
+    QUALIFYING_GAP_FILL,
+    clean_grid_position,
+    gap_to_pole,
+    get_feature_columns,
+    previous_races,
+    weighted_recent_form,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -199,50 +206,48 @@ def get_qualifying_grid(year: int, round_number: int) -> pd.DataFrame:
         session.load(telemetry=False, weather=False, messages=False)
 
         results = session.results.copy()
-        results['GridPosition'] = pd.to_numeric(results['Position'], errors='coerce')
+        results['GridPosition'] = clean_grid_position(results['Position'])
         results['Driver'] = results['Abbreviation']
         results['Team'] = results['TeamName']
+        # Same definition as in training (gap to the fastest Q3 time)
+        results['QualifyingGap'] = gap_to_pole(results['Q3']).fillna(QUALIFYING_GAP_FILL)
+        results['CircuitName'] = session.event.get('Location', 'Unknown')
 
-        return results[['Driver', 'Team', 'GridPosition', 'FullName']]
+        return results[['Driver', 'Team', 'GridPosition', 'FullName', 'QualifyingGap', 'CircuitName']]
 
     except Exception as e:
         logger.warning(f"Could not load qualifying data: {e}")
         return pd.DataFrame()
 
 
-def calculate_driver_track_history(driver: str, circuit: str, races_df: pd.DataFrame) -> float:
-    """Calculate a driver's average position at a specific circuit."""
+def _numeric_races(races_df: pd.DataFrame) -> pd.DataFrame:
+    races_df = races_df.copy()
+    for col in ['Position', 'Year', 'Round']:
+        races_df[col] = pd.to_numeric(races_df[col], errors='coerce')
+    return races_df
+
+
+def calculate_driver_track_history(
+    driver: str, circuit: str, races_df: pd.DataFrame, year: int, round_number: int
+) -> float:
+    """
+    A driver's average finishing position at this circuit in races before
+    (year, round). Matches on CircuitName, exactly like training does.
+    """
+    if races_df.empty or not circuit:
+        return np.nan
+    races_df = _numeric_races(races_df)
+    before = (races_df['Year'] < year) | ((races_df['Year'] == year) & (races_df['Round'] < round_number))
+    driver_races = races_df[(races_df['Abbreviation'] == driver) & (races_df['CircuitName'] == circuit) & before]
+    return driver_races['Position'].mean() if len(driver_races) > 0 else np.nan
+
+
+def calculate_recent_form(driver: str, races_df: pd.DataFrame, year: int, round_number: int, n_races: int = 3) -> float:
+    """Weighted recent form before (year, round), computed exactly like the training feature."""
     if races_df.empty:
         return np.nan
-
-    # Ensure Position is numeric
-    races_df = races_df.copy()
-    races_df['Position'] = pd.to_numeric(races_df['Position'], errors='coerce')
-
-    driver_races = races_df[
-        (races_df['Abbreviation'] == driver) &
-        (races_df['EventName'].str.contains(circuit, case=False, na=False))
-    ]
-
-    if len(driver_races) > 0:
-        return driver_races['Position'].mean()
-    return np.nan
-
-
-def calculate_recent_form(driver: str, races_df: pd.DataFrame, n_races: int = 3) -> float:
-    """Calculate driver's average position in last N races."""
-    if races_df.empty:
-        return np.nan
-
-    # Ensure Position is numeric
-    races_df = races_df.copy()
-    races_df['Position'] = pd.to_numeric(races_df['Position'], errors='coerce')
-
-    driver_races = races_df[races_df['Abbreviation'] == driver].tail(n_races)
-
-    if len(driver_races) > 0:
-        return driver_races['Position'].mean()
-    return np.nan
+    prev = previous_races(_numeric_races(races_df), driver, year, round_number, n_races)
+    return weighted_recent_form(prev['Position'].values[::-1])
 
 
 def prepare_prediction_features(year: int, round_number: int, data_prefix: str = DEFAULT_DATA_PREFIX) -> pd.DataFrame:
@@ -287,21 +292,23 @@ def prepare_prediction_features(year: int, round_number: int, data_prefix: str =
             constructor_points = 0
 
         # Track history and recent form
-        track_history = calculate_driver_track_history(driver, "", historical_races)
-        recent_form = calculate_recent_form(driver, historical_races)
+        track_history = calculate_driver_track_history(
+            driver, row['CircuitName'], historical_races, year, round_number
+        )
+        recent_form = calculate_recent_form(driver, historical_races, year, round_number)
 
         features.append({
             'Driver': driver,
             'FullName': row['FullName'],
             'Team': team,
-            'GridPosition': grid_pos if pd.notna(grid_pos) else 20,
+            'GridPosition': grid_pos,
             'DriverChampPosition': driver_champ_pos,
             'DriverPoints': driver_points,
             'ConstructorChampPosition': constructor_champ_pos,
             'ConstructorPoints': constructor_points,
             'TrackHistoryAvgPos': track_history if pd.notna(track_history) else grid_pos,
             'RecentForm': recent_form if pd.notna(recent_form) else grid_pos,
-            'QualifyingGap': 5.0  # Default value
+            'QualifyingGap': row['QualifyingGap']
         })
 
     return pd.DataFrame(features)
@@ -386,13 +393,14 @@ def display_predictions(results: pd.DataFrame, event_name: str = "Race"):
 def predict_from_historical(
     year: int,
     round_number: int,
-    data_prefix: str = DEFAULT_DATA_PREFIX
+    data_prefix: str = DEFAULT_DATA_PREFIX,
+    model_name: str = "best_model"
 ) -> pd.DataFrame:
     """
     Make predictions using historical data (for testing).
     Uses already collected qualifying data.
     """
-    model = load_model("best_model")
+    model = load_model(model_name)
 
     # Load features file
     features_path = resolve_data_file(data_prefix, "features")
@@ -425,6 +433,19 @@ def predict_from_historical(
     results['PredictedRank'] = range(1, len(results) + 1)
 
     return results
+
+
+def was_training_race(year: int, round_number: int, data_prefix: str = DEFAULT_DATA_PREFIX) -> bool:
+    """
+    True if the race falls in the training part of the chronological split
+    used by src.model (everything before the newest TEST_SIZE share of rows).
+    """
+    features_path = resolve_data_file(data_prefix, "features")
+    if not features_path.exists():
+        return False
+    races = pd.read_csv(features_path, usecols=['Year', 'Round']).sort_values(['Year', 'Round'])
+    first_test = races.iloc[len(races) - max(1, int(len(races) * TEST_SIZE))]
+    return (year, round_number) < (int(first_test['Year']), int(first_test['Round']))
 
 
 def compare_predictions(results: pd.DataFrame, event_name: str = "Race"):
@@ -636,7 +657,7 @@ def build_prediction_from_standings(
             'ConstructorPoints': row['ConstructorPointsBefore'],
             'TrackHistoryAvgPos': grid_pos,
             'RecentForm': grid_pos,
-            'QualifyingGap': 5.0
+            'QualifyingGap': QUALIFYING_GAP_FILL
         })
 
     features_df = pd.DataFrame(features)
@@ -743,7 +764,7 @@ def predict_next_race(
         return None
 
 
-def predict_with_custom_grid(grid_order: list, year: int = 2025, model_name: str = "best_model"):
+def predict_with_custom_grid(grid_order: list, year: int, model_name: str = "best_model"):
     """
     Make predictions with a custom starting grid.
     Useful for predicting before qualifying or with hypothetical scenarios.
@@ -788,7 +809,7 @@ def predict_with_custom_grid(grid_order: list, year: int = 2025, model_name: str
             'ConstructorPoints': constructor_points,
             'TrackHistoryAvgPos': grid_pos,
             'RecentForm': grid_pos,
-            'QualifyingGap': 5.0
+            'QualifyingGap': QUALIFYING_GAP_FILL
         })
 
     features_df = pd.DataFrame(features)
@@ -834,96 +855,6 @@ def predict_from_standings(
     return results
 
 
-# 2025 F1 Grid (for reference)
-F1_2025_DRIVERS = [
-    ('VER', 'Red Bull Racing'),
-    ('LAW', 'Red Bull Racing'),
-    ('LEC', 'Ferrari'),
-    ('HAM', 'Ferrari'),
-    ('NOR', 'McLaren'),
-    ('PIA', 'McLaren'),
-    ('RUS', 'Mercedes'),
-    ('ANT', 'Mercedes'),
-    ('ALO', 'Aston Martin'),
-    ('STR', 'Aston Martin'),
-    ('GAS', 'Alpine'),
-    ('DOO', 'Alpine'),
-    ('TSU', 'Racing Bulls'),
-    ('HAD', 'Racing Bulls'),
-    ('ALB', 'Williams'),
-    ('SAI', 'Williams'),
-    ('HUL', 'Sauber'),
-    ('BOR', 'Sauber'),
-    ('OCO', 'Haas'),
-    ('BEA', 'Haas'),
-]
-
-
-def predict_2025_race(grid_order: list = None, event_name: str = "2025 Race", model_name: str = "best_model"):
-    """
-    Predict a 2025 race with custom or default grid.
-    Uses 2024 standings data for driver performance metrics.
-    """
-    print("\n" + "=" * 70)
-    print(f"[F1] 2025 PREDICTION: {event_name}")
-    print("=" * 70)
-
-    model = load_model(model_name)
-
-    # Use provided grid or default to championship-like order
-    if grid_order is None:
-        grid_order = [d[0] for d in F1_2025_DRIVERS]
-        print("Using default 2025 driver lineup as grid order")
-    else:
-        print("Using custom grid order")
-
-    print("-" * 70)
-
-    # Build features (using estimated values for 2025 drivers)
-    driver_teams = {d[0]: d[1] for d in F1_2025_DRIVERS}
-
-    features = []
-    for grid_pos, driver in enumerate(grid_order, 1):
-        team = driver_teams.get(driver, "Unknown")
-
-        # Estimated championship positions based on 2024/expected performance
-        estimated_positions = {
-            'VER': 1, 'NOR': 2, 'LEC': 3, 'PIA': 4, 'HAM': 5,
-            'RUS': 6, 'SAI': 7, 'ALO': 8, 'GAS': 9, 'HUL': 10,
-            'TSU': 11, 'STR': 12, 'ALB': 13, 'OCO': 14, 'LAW': 15,
-            'ANT': 16, 'DOO': 17, 'HAD': 18, 'BOR': 19, 'BEA': 20
-        }
-
-        features.append({
-            'Driver': driver,
-            'FullName': driver,
-            'Team': team,
-            'GridPosition': grid_pos,
-            'DriverChampPosition': estimated_positions.get(driver, 15),
-            'DriverPoints': max(0, (21 - estimated_positions.get(driver, 15)) * 10),
-            'ConstructorChampPosition': grid_pos // 2 + 1,
-            'ConstructorPoints': max(0, (11 - grid_pos // 2) * 20),
-            'TrackHistoryAvgPos': grid_pos,
-            'RecentForm': estimated_positions.get(driver, 15),
-            'QualifyingGap': 5.0
-        })
-
-    features_df = pd.DataFrame(features)
-    feature_cols = get_feature_columns()
-    X = features_df[feature_cols]
-
-    predictions = predict_positions(model, X)
-
-    results = features_df[['Driver', 'FullName', 'Team', 'GridPosition']].copy()
-    results['PredictedPosition'] = predictions
-    results = results.sort_values('PredictedPosition').reset_index(drop=True)
-    results['PredictedRank'] = range(1, len(results) + 1)
-
-    display_predictions(results, event_name)
-
-    return results
-
-
 def main():
     parser = argparse.ArgumentParser(description='F1 Race Position Predictor')
     parser.add_argument('--year', type=str, default='auto', help="Season year or 'auto' for current year")
@@ -956,27 +887,32 @@ def main():
     elif args.current_standings:
         display_current_standings(effective_year, args.data_prefix)
     elif args.race:
-        try:
-            race_info = resolve_race_query(args.race, effective_year)
-            print("\n" + "=" * 80)
-            print(f"[F1] HISTORICAL ANALYSIS: {race_info['event_name']}")
-            print("Comparing model predictions against the actual race results.")
-            print("=" * 80)
-            results = predict_from_historical(race_info['year'], race_info['round'], args.data_prefix)
-            compare_predictions(results, race_info['event_name'])
-        except ValueError as exc:
-            parser.error(str(exc))
-            return
-    elif args.race:
+        # A race already in the collected data is compared with its real result;
+        # an upcoming race is predicted from its qualifying grid. (Previously a
+        # second, unreachable --race branch meant upcoming races failed.)
         try:
             race_info = resolve_race_query(args.race, effective_year)
         except ValueError as exc:
             parser.error(str(exc))
             return
 
-        results = predict_race(race_info['year'], race_info['round'], args.model, args.data_prefix)
-        if not results.empty:
-            display_predictions(results, race_info['event_name'])
+        try:
+            results = predict_from_historical(race_info['year'], race_info['round'], args.data_prefix, args.model)
+        except (ValueError, FileNotFoundError):
+            results = None
+
+        if results is not None:
+            print("\n" + "=" * 80)
+            print(f"[F1] HISTORICAL ANALYSIS: {race_info['event_name']}")
+            print("Comparing model predictions against the actual race results.")
+            if was_training_race(race_info['year'], race_info['round'], args.data_prefix):
+                print("Note: this race was part of the training data, so the comparison is optimistic.")
+            print("=" * 80)
+            compare_predictions(results, race_info['event_name'])
+        else:
+            results = predict_race(race_info['year'], race_info['round'], args.model, args.data_prefix)
+            if not results.empty:
+                display_predictions(results, race_info['event_name'])
     elif args.standings:
         # Predict from championship standings
         predict_from_standings(effective_year, args.model, args.data_prefix)
@@ -985,7 +921,7 @@ def main():
         predict_next_race(args.model, args.data_prefix, effective_year, args.next_mode)
     elif args.compare and args.round:
         # Use historical data for comparison
-        results = predict_from_historical(effective_year, args.round, args.data_prefix)
+        results = predict_from_historical(effective_year, args.round, args.data_prefix, args.model)
         compare_predictions(results, f"{effective_year} Round {args.round}")
     elif args.round:
         # Predict specific race
